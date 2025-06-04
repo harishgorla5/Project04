@@ -1,72 +1,114 @@
 pipeline {
     agent any
-
+ 
     environment {
-        // Start versioning at 4.0 and increment with each build
-        BASE_VERSION = 4.0
-        VERSION_TAG = "v${BASE_VERSION + BUILD_NUMBER - 1}" // Increment version with each build
+        DOCKER_CREDENTIALS_ID = 'project4'  
+        GIT_REPO_URL = 'https://github.com/harishgorla5/Project04.git'  
+        DOCKER_IMAGE_NAME = 'harishgorla5/project4'
+        SLACK_CHANNEL = '#ci-cd-buildstatus'
+        GIT_BRANCH = 'project4'
+        AWS_REGION = 'ap-south-1'
+        SLACK_CREDENTIALS_ID = 'slack'
+        EKS_CLUSTER_NAME = 'batch071-eks'
     }
-
+ 
     stages {
-        stage('Download Code') {
+        stage('Clone GitHub Repository') {
             steps {
-                echo "Cloning taxi-booking repository from GitHub..."
-                git branch: 'dev', url: 'https://github.com/harishgorla5/car-booking.git'
+                git url: "${GIT_REPO_URL}", branch: 'project4'
             }
         }
-
-        stage('Build Code') {
+ 
+        stage('Build and Prepare Docker Image') {
             steps {
-                echo "Building the taxi-booking project with Maven..."
-                sh 'mvn clean install'
-            }
-        }
-
-        stage('Build Image') {
-            steps {
-                echo "Cloning Project4 repository, copying .war file, and building Docker image..."
-
-                // Clone Project4 repository
-                dir('Project4') {
-                    git branch: 'project4', url: 'https://github.com/harishgorla5/Project4.git'
-                }
-
-                // Copy the .war file from taxi-booking to Project4 directory
-                sh 'cp /var/lib/jenkins/workspace/dev-cab-booking/taxi-booking/target/cabbooking.war ${WORKSPACE}/Project4/'
-
-                // Delete all old Docker images locally
-                sh '''
-                docker images -q | xargs -I {} docker rmi -f {} || true
-                '''
-
-                // Build Docker image with latest tag and versioned tag
                 script {
-                    // Build Docker image and tag it with latest and version
-                    docker.build("harishgorla5/project4:latest", "-f ${WORKSPACE}/Project4/Dockerfile ${WORKSPACE}/Project4")
-                    docker.build("harishgorla5/project4:${VERSION_TAG}", "-f ${WORKSPACE}/Project4/Dockerfile ${WORKSPACE}/Project4")
+                    def latestTag = sh(
+                        script: 'curl -s https://hub.docker.com/v2/repositories/harishgorla5/project4/tags | jq -r \'.results | map(select(.name | test("^v[0-9]+\\\\.[0-9]+$"))) | sort_by(.name) | last | .name\' || echo "v4.0"',
+                        returnStdout: true
+                    ).trim()
+ 
+                    if (latestTag == "null" || !latestTag.startsWith("v")) {
+                        latestTag = "v4.0"
+                    }
+ 
+                    def versionParts = latestTag.substring(1).split('\\.')
+                    def major = versionParts[0].toInteger()
+                    def minor = versionParts[1].toInteger() + 1
+                    env.IMAGE_VERSION = "v${major}.${minor}"
+ 
+                    echo "New Docker Image Version: ${env.IMAGE_VERSION}"
+ 
+                    withCredentials([string(credentialsId: DOCKER_CREDENTIALS_ID, variable: 'DOCKER_TOKEN')]) {
+                        sh 'echo "$DOCKER_TOKEN" | docker login -u "harishgorla5" --password-stdin'
+                    }
+ 
+                    sh 'docker pull nginx:latest'
+ 
+                    if (fileExists('index.html')) {
+                        writeFile file: 'Dockerfile', text: '''
+                        FROM nginx:latest
+                        COPY index.html /usr/share/nginx/html/index.html
+                        '''
+                    } else {
+                        error "index.html file is missing!"
+                    }
+ 
+                    sh """
+                        docker build -t ${DOCKER_IMAGE_NAME}:${IMAGE_VERSION} -t ${DOCKER_IMAGE_NAME}:latest .
+                    """
                 }
             }
         }
-
-        stage('Push Docker Hub') {
+ 
+        stage('Push Updated Image to Docker Hub') {
             steps {
-                echo "Pushing Docker image to Docker Hub..."
-
-                // Login to Docker Hub using Secret Text credential (for password)
-                withCredentials([string(credentialsId: 'project4', variable: 'DOCKER_PASSWORD')]) {
-                    // Use Docker Hub username and password stored in the secret text
-                    sh 'echo $DOCKER_PASSWORD | docker login -u harishgorla5 --password-stdin'
+                script {
+                    sh "docker push ${DOCKER_IMAGE_NAME}:${IMAGE_VERSION}"
+                    sh "docker push ${DOCKER_IMAGE_NAME}:latest"
                 }
-
-                // Push both the latest and versioned image to Docker Hub
-                sh '''
-                docker push harishgorla5/project4:latest
-                docker push harishgorla5/project4:${VERSION_TAG}
-                '''
-				// Delete all Docker images locally
-                sh '''
-                docker images -q | xargs -I {} docker rmi -f {} || true
-                '''
+            }
+        }
+        
+        stage('Deploy to EKS') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'aws-creds', usernameVariable: 'AWS_ACCESS_KEY_ID', passwordVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                    sh '''
+                        export AWS_DEFAULT_REGION=${AWS_REGION}
+                        aws eks update-kubeconfig --region ${AWS_REGION} --name ${EKS_CLUSTER_NAME}
+                        kubectl apply -f project04.yaml
+                        kubectl rollout status deployment/project4-deployment --timeout=60s
+                    '''
+                }
+            }
+        }
+    }
+ 
+    post {
+        success {
+            script {
+                slackSend(
+                    channel: "${SLACK_CHANNEL}",
+                    color: "good",
+                    credentialsId: "${SLACK_CREDENTIALS_ID}",
+                    message: "✅ *SUCCESS*: Jenkins Build Completed! 🎉\n*Project:* Project04\n*Version:* ${IMAGE_VERSION}\n*Docker Image:* ${DOCKER_IMAGE_NAME}:latest"
+                )
+            }
+        }
+        failure {
+            script {
+                slackSend(
+                    channel: "${SLACK_CHANNEL}",
+                    color: "danger",
+                    credentialsId: "${SLACK_CREDENTIALS_ID}",
+                    message: "❌ *FAILED*: Jenkins Build Failed! 🚨\n*Project:* Project04\n*Check Jenkins logs for errors.*"
+                )
+            }
+        }
+        always {
+            script {
+                echo "🧹 Removing all local Docker images..."
+                sh 'docker rmi -f $(docker images -aq) || echo "No images to remove."'
+                sh 'docker system prune -f'
             }
         }
     }
